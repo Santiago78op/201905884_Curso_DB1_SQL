@@ -22,14 +22,15 @@
 4. [Subqueries en FROM y SELECT](#4-subqueries-en-from-y-select)
 5. [Common Table Expressions (CTEs)](#5-common-table-expressions-ctes)
 
-**Vistas y columnas derivadas**
+**Vistas, índices y columnas derivadas**
 6. [Vistas (Views)](#6-vistas-views)
-7. [Vistas indexadas (materializadas)](#7-vistas-indexadas-materializadas)
-8. [Columnas calculadas y columnas persistidas](#8-columnas-calculadas-y-columnas-persistidas)
+7. [Índices](#7-índices)
+8. [Vistas indexadas (materializadas)](#8-vistas-indexadas-materializadas)
+9. [Columnas calculadas y columnas persistidas](#9-columnas-calculadas-y-columnas-persistidas)
 
 **Lógica del lado del servidor**
-9. [Stored Procedures (SP)](#9-stored-procedures-sp)
-10. [Triggers](#10-triggers)
+10. [Stored Procedures (SP)](#10-stored-procedures-sp)
+11. [Triggers](#11-triggers)
 
 [**Temas pendientes por incorporar →**](#temas-pendientes-por-incorporar)
 
@@ -270,7 +271,80 @@ EXEC sp_helptext 'VW_VentasPorPais';
 
 ---
 
-## 7. Vistas indexadas (materializadas)
+## 7. Índices
+**Tema transversal** · Aplicado al caso de estudio `TiendaLatam` v1 (`ddl/ddl.sql`).
+
+**Concepto clave:** Un índice es una **estructura paralela** (un árbol B-tree) que SQL Server mantiene ordenada por una o más columnas que vos elegís. No es una copia de la tabla — es una "tabla de contenidos" que apunta a las filas reales. Igual que el índice alfabético al final de un libro: en vez de leer 800 páginas para encontrar "JOINs", vas al índice, ves "JOINs … pág. 412", y saltás directo.
+
+**¿Por qué importa?** Sin índice, una query como `WHERE Total > 5000` recorre **todas las filas de la tabla** una por una para ver cuáles cumplen — esto se llama **table scan**. Con un índice sobre `Total`, SQL Server salta directo al primer valor mayor a 5000 y lee desde ahí — esto se llama **index seek**. En una tabla de pocos miles de filas la diferencia ya se nota; en una de millones, es de varios órdenes de magnitud. Es la herramienta #1 para hacer queries más rápidas sin reescribir SQL.
+
+Hay dos tipos básicos que tenés que distinguir:
+- **CLUSTERED:** define el **orden físico** de las filas en disco. Solo puede haber **uno por tabla** (la tabla "es" su clustered index). Por convención, SQL Server crea uno automáticamente sobre la `PRIMARY KEY` si no decís lo contrario — por eso en `ddl.sql` no ves `CREATE CLUSTERED INDEX` explícito.
+- **NONCLUSTERED:** estructura **separada** que apunta a las filas (igual que el índice de un libro). Una tabla puede tener **muchos**. Los que aparecen en `ddl.sql` (`IX_Pedidos_ClienteID`, `IX_Clientes_PaisID`, `IX_DetallePedidos_ProductoID`, etc.) son todos NONCLUSTERED, creados manualmente sobre las claves foráneas.
+
+**Sintaxis mínima:**
+```sql
+-- Índice básico (NONCLUSTERED por defecto)
+CREATE INDEX IX_Pedidos_FechaPedido ON Pedidos(FechaPedido);
+
+-- Explícito + sobre múltiples columnas (índice compuesto)
+CREATE NONCLUSTERED INDEX IX_Pedidos_Cliente_Fecha
+    ON Pedidos(ClienteID, FechaPedido DESC);
+
+-- Único (impide duplicados, mismo efecto que UNIQUE constraint)
+CREATE UNIQUE INDEX UQ_Clientes_Email ON Clientes(Email);
+
+-- Eliminar
+DROP INDEX IX_Pedidos_FechaPedido ON Pedidos;
+
+-- Ver todos los índices de una tabla
+SELECT i.name, i.type_desc, i.is_unique
+FROM sys.indexes i
+WHERE i.object_id = OBJECT_ID('Pedidos')
+  AND i.type > 0;   -- 0 = heap (tabla sin clustered index)
+```
+
+**Ejemplo medible — table scan vs index seek sobre `Pedidos.Total`:**
+
+`ddl.sql` indexa `Pedidos.ClienteID`, `Pedidos.FechaPedido`, `Pedidos.Estado`, etc., pero **no** indexa `Pedidos.Total`. Aprovechamos esa columna para ver la diferencia con tus propios ojos en SSMS:
+
+```sql
+-- Activá Execution Plan en SSMS (Ctrl+M) y los contadores de I/O
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+
+-- (1) SIN índice: Pedidos.Total no está indexado
+SELECT * FROM Pedidos WHERE Total > 5000;
+-- Pestaña Messages: "Table 'Pedidos'. Scan count 1, logical reads N"
+--                  Plan: "Clustered Index Scan" (recorre toda la tabla)
+
+-- (2) Crear el índice sobre Total
+CREATE NONCLUSTERED INDEX IX_Pedidos_Total ON Pedidos(Total);
+
+-- (3) MISMA query, ahora con índice
+SELECT * FROM Pedidos WHERE Total > 5000;
+-- Pestaña Messages: "Table 'Pedidos'. Scan count 1, logical reads M"
+--                  con M << N. Plan: "Index Seek + Key Lookup"
+
+-- (4) Limpieza (este índice era solo para el ejercicio)
+DROP INDEX IX_Pedidos_Total ON Pedidos;
+```
+
+Lo importante no son los números exactos (dependen del tamaño de tu data cargada por `bulk_insert.sql`), sino la **proporción**: con índice, SQL Server hace muchas menos lecturas lógicas y el operador del plan cambia de **Scan** a **Seek**. Eso es lo que tenés que saber leer.
+
+**Puntos finos / errores comunes:**
+- **Los índices no son gratis.** Ocupan disco (una copia ordenada de las columnas indexadas + puntero a la fila) y hacen más lentos los `INSERT`/`UPDATE`/`DELETE`, porque cada cambio en la tabla obliga a SQL Server a actualizar también todos los índices afectados. Regla: **indexás lo que se lee mucho, no todo.**
+- **Las FK no se indexan solas.** Crear una `FOREIGN KEY` **no** crea índice sobre la columna hija. Por eso `ddl.sql` agrega manualmente `IX_Pedidos_ClienteID`, `IX_Clientes_PaisID`, `IX_DetallePedidos_PedidoID`, etc. — sin esos índices, cada JOIN hijo→padre haría table scan en el lado hijo.
+- **Cardinalidad baja = índice inútil.** Si la columna tiene 3 valores distintos en millones de filas (ej. `Pedidos.Estado` con `'Pendiente'/'Completado'/'Cancelado'`), el optimizador suele ignorar el índice y hacer scan igual. La excepción son los **índices filtrados** (`WHERE Estado = 'Pendiente'`), tema avanzado.
+- **El orden de columnas importa en índices compuestos.** `INDEX(ClienteID, FechaPedido)` sirve para `WHERE ClienteID = X` y para `WHERE ClienteID = X AND FechaPedido > Y`, pero **NO** sirve para `WHERE FechaPedido > Y` sola. Regla: la columna más selectiva (o la que aparece sola en `WHERE` con más frecuencia) va primero.
+- **Convención de nombres en este repo:** `PK_<Tabla>` para primary key (clustered por defecto), `IX_<Tabla>_<Columna>` para NONCLUSTERED, `UQ_<Tabla>_<Columna>` para únicos. Esto se ve consistente en `ddl.sql` y `ddl_v2.sql`. Nunca dejes que SQL Server auto-nombre un índice — hace imposibles los drops idempotentes.
+- **¿Cómo sé si un índice se está usando?** `sys.dm_db_index_usage_stats` te dice cuántos `seeks`, `scans` y `lookups` recibió cada índice desde el último reinicio del servidor. Un índice con 0 seeks en producción durante semanas es candidato a borrar — está costando escrituras sin pagar lecturas.
+
+**Cuándo usarlo (y cuándo NO):** SÍ sobre **claves foráneas** (siempre), columnas frecuentes en `WHERE`/`JOIN`/`ORDER BY`, y columnas con alta cardinalidad. NO sobre tablas con muchísimas más escrituras que lecturas, columnas que casi nunca aparecen en filtros, o columnas con cardinalidad muy baja. **Regla del instructor:** *medí primero, indexá después, nunca al revés* — no metas índices "por si acaso"; medí con `STATISTICS IO` y el plan de ejecución qué query lenta tenés y qué columna estás filtrando, y recién entonces indexá.
+
+---
+
+## 8. Vistas indexadas (materializadas)
 **Carpeta:** `Index_vistas/` · **Script:** `script_vistas_indexadas.sql` · **Playbook:** `vistas-indexadas-en-sql-server.pdf`
 
 **Concepto clave:** Una vista indexada **almacena físicamente el resultado** de la query (no solo la definición). En otras bases de datos se llama vista materializada. SQL Server la mantiene actualizada automáticamente cuando las tablas base cambian.
@@ -307,7 +381,7 @@ ON VW_VentasPorPais(PaisID);
 
 ---
 
-## 8. Columnas calculadas y columnas persistidas
+## 9. Columnas calculadas y columnas persistidas
 **Carpeta:** `Columnas_Calculadas_vs_Computadas_persistidas/` · **Script:** `script_columnas_computadas.sql` · **Playbook:** `columnas-calculadas-y-columnas-computadas-persistidas.pdf`
 
 **Concepto clave:** Una columna calculada es una **fórmula guardada como columna de la tabla**. Por defecto se recalcula al consultar; con `PERSISTED` el resultado se almacena en disco y solo se recalcula cuando cambian las columnas de las que depende.
@@ -346,7 +420,7 @@ CREATE INDEX IX_Productos_Margen ON Productos(MargenPorcentaje);
 
 ---
 
-## 9. Stored Procedures (SP)
+## 10. Stored Procedures (SP)
 **Carpeta:** `Store_Procedure_SQL/` · **Script:** `script_stored_procedures.sql` · **Playbook:** `stored-procedures-en-sql-server.pdf`
 
 **Concepto clave:** Un SP es un **bloque de código SQL con nombre** guardado en la base de datos, que recibe parámetros y se ejecuta con `EXEC`. Es un "contrato": acepta inputs definidos, ejecuta una lógica fija y devuelve un resultado predecible.
@@ -396,7 +470,7 @@ EXEC SP_ConsultarVentasPorPais 'CL', '2024-01-01', '2024-12-31';
 
 ---
 
-## 10. Triggers
+## 11. Triggers
 **Carpeta:** `Trigger/` · **Script:** `script_triggers.sql` · **Playbook:** `triggers-en-sql-server.pdf`
 
 **Concepto clave:** Un trigger es **código que se ejecuta solo**, automáticamente, cuando ocurre un `INSERT`, `UPDATE` o `DELETE` en una tabla. Nadie lo invoca con `EXEC` — se dispara por su cuenta. Puede ser `AFTER` (después del evento) o `INSTEAD OF` (en lugar del evento).
@@ -457,7 +531,7 @@ END;
 
 ### Pista para futuros temas
 
-Cuando organices la siguiente tanda, considerá el flujo natural que sigue al estado actual: **funciones (escalares, tabla, multistatement)**, **window functions** (`OVER`, `PARTITION BY`, `ROW_NUMBER`, `LAG`/`LEAD`), **transacciones e `ISOLATION LEVEL`**, **MERGE**, **TVPs y procedimientos atómicos** (como `usp_CrearPedido` de `ddl_v2.sql`), **tablas temporales del sistema**, **índices avanzados** (covering, filtrados, columnstore), **Query Store / planes de ejecución**. No es prescripción — es la lista corta de lo que viene después en un programa típico de "SQL Server para analistas que se profesionalizan".
+Cuando organices la siguiente tanda, considerá el flujo natural que sigue al estado actual: **funciones (escalares, tabla, multistatement)**, **window functions** (`OVER`, `PARTITION BY`, `ROW_NUMBER`, `LAG`/`LEAD`), **transacciones e `ISOLATION LEVEL`**, **MERGE**, **TVPs y procedimientos atómicos** (como `usp_CrearPedido` de `ddl_v2.sql`), **tablas temporales del sistema**, **índices avanzados** (covering, filtrados, columnstore — los básicos quedaron cubiertos en §7), **Query Store / planes de ejecución**. No es prescripción — es la lista corta de lo que viene después en un programa típico de "SQL Server para analistas que se profesionalizan".
 
 ---
 
