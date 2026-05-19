@@ -521,6 +521,120 @@ END;
 
 **Cuándo usarlo (y cuándo NO):** SÍ para auditoría (quién cambió qué y cuándo) y para proteger integridad de datos. NO para lógica de negocio compleja (eso es de SPs), NO para validaciones que se resuelven con `CHECK` constraints, NO para replicación en tiempo real, NO para cálculos que pueden vivir en columnas calculadas. Criterio del instructor: trigger = auditoría e integridad; cualquier otra cosa → herramienta distinta.
 
+> [!note] Ampliado 2026-05-19 por Julián
+> Recorrido conceptual: cómo se llega al trigger desde un problema real, por qué `BEFORE` no existe en SQL Server, y cómo elegir entre `AFTER` e `INSTEAD OF` desde el problema (no desde la sintaxis).
+
+### Cómo se llega al trigger desde el problema
+
+Punto de partida típico: `dbo.Pedidos` tiene una columna `Total` y `dbo.DetallePedidos` tiene los subtotales por línea. Querés que `Pedidos.Total` se mantenga sincronizado **solo**, sin que la aplicación tenga que recalcularlo.
+
+La tentación inicial es resolverlo con una **columna calculada**:
+
+```sql
+ALTER TABLE dbo.Pedidos
+ADD Total AS (
+    SELECT SUM(d.Subtotal)
+    FROM dbo.DetallePedidos AS d
+    WHERE d.PedidoID = Pedidos.PedidoID
+);
+```
+
+SQL Server lo rechaza:
+
+```
+Msg 1046, Level 15, State 1
+Subqueries are not allowed in this context. Only scalar expressions are allowed.
+```
+
+La frontera que importa: **una columna calculada solo ve la fila en la que vive**. No puede agregar sobre otras tablas, no puede cruzar relaciones. La fórmula conceptual era correcta; el lugar donde se pone no la admite.
+
+Cuando la lógica necesita (a) cruzar tablas y (b) dispararse automáticamente al cambiar otra tabla, la herramienta que cumple las dos cosas es el **trigger**.
+
+### Por qué SQL Server no tiene `BEFORE`
+
+En MySQL, PostgreSQL y Oracle existen triggers `BEFORE INSERT`, `BEFORE UPDATE`, etc. **SQL Server no**. Solo tiene dos tipos: `AFTER` (sinónimo: `FOR`) e `INSTEAD OF`. Si venís de otro motor, este es el primer punto que cambia de dialecto.
+
+¿Por qué este diseño? Porque casi todos los casos donde otros motores usan `BEFORE`, SQL Server los cubre con uno de los otros dos:
+
+- *"Quiero recalcular un agregado después del cambio"* → `AFTER` (la fila ya está, puedo agregarla en mi `SUM`).
+- *"Quiero interceptar y reemplazar la operación"* → `INSTEAD OF` (el evento original ni siquiera ocurre).
+- *"Quiero validar antes de aceptar el cambio"* → `CHECK constraint`, `FK`, o `INSTEAD OF` con `RAISERROR` + `ROLLBACK`.
+
+Caso testigo: si quisieras sincronizar `Pedidos.Total` corriendo **antes** del `INSERT` en `DetallePedidos`, el `SUM(Subtotal)` no vería la línea nueva todavía y guardaría un total atrasado. El "antes" no resuelve el problema; el "después" sí. Por eso, para este caso, `AFTER INSERT` es lo correcto.
+
+### `AFTER` vs `INSTEAD OF` — criterio de elección
+
+| Pregunta de diseño | Tipo de trigger |
+|---|---|
+| La operación original sí debe ocurrir, y además quiero reaccionar (recalcular, auditar, propagar). | `AFTER` |
+| La operación original **no** debe ocurrir como la pidió el usuario — quiero sustituirla. | `INSTEAD OF` |
+| Quiero convertir un `DELETE` en un `UPDATE` (soft delete). | `INSTEAD OF DELETE` |
+| Quiero hacer escribible una vista que normalmente no lo es (vista con `GROUP BY`, JOINs, etc.). | `INSTEAD OF` sobre la vista |
+
+Regla mental corta: **`AFTER` reacciona, `INSTEAD OF` sustituye.**
+
+### Ejemplo dirigido — soft delete sobre `dbo.Productos`
+
+Política de negocio: un producto nunca se borra físicamente, porque puede estar referenciado por pedidos históricos (rompería integridad referencial o, peor, dejaría líneas de pedido huérfanas). Si alguien hace `DELETE FROM dbo.Productos WHERE ProductoID = 42;`, lo que debe ocurrir en realidad es `Activo = 0`.
+
+`dbo.Productos` ya tiene la columna `Activo BIT NOT NULL DEFAULT 1` desde el DDL de v1 (`ddl/ddl.sql`, línea 87) — el diseño anticipa el soft delete.
+
+```sql
+CREATE TRIGGER trg_Productos_SoftDelete
+ON dbo.Productos
+INSTEAD OF DELETE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE p
+       SET Activo = 0
+      FROM dbo.Productos p
+INNER JOIN deleted d ON p.ProductoID = d.ProductoID;
+END;
+GO
+```
+
+**Por qué funciona:**
+
+- `INSTEAD OF DELETE` intercepta el `DELETE`; el borrado físico nunca ocurre.
+- `deleted` es la pseudotabla que contiene **todas las filas** que el usuario intentó borrar (puede ser 1, puede ser 50). El `INNER JOIN` con `deleted` hace que el trigger funcione igual de bien para borrados de una fila o de muchas — esto es lo que significa escribir el trigger **en operaciones de conjunto**, no fila por fila. Si lo escribieras con un `WHERE ProductoID = <uno solo>`, fallarías el primer día que alguien borre dos productos en el mismo `DELETE`.
+- La PK de `dbo.Productos` se llama `ProductoID` — el join va por ese campo. **Verificalo siempre contra el DDL antes de escribir el trigger**, no de memoria (ver siguiente bloque).
+
+**Prueba rápida:**
+
+```sql
+-- Antes: producto activo
+SELECT ProductoID, NombreProducto, Activo
+FROM dbo.Productos WHERE ProductoID = 42;
+-- Activo = 1
+
+DELETE FROM dbo.Productos WHERE ProductoID = 42;
+-- 1 row affected (lo que ve la app)
+
+-- Después: la fila NO se borró, se marcó
+SELECT ProductoID, NombreProducto, Activo
+FROM dbo.Productos WHERE ProductoID = 42;
+-- Activo = 0  ← el trigger sustituyó el DELETE por un UPDATE
+```
+
+### Trampa frecuente — nombrar columnas de memoria
+
+Una clase entera de errores en triggers son nombres de columna inventados (`IdProducto` en lugar de `ProductoID`, `id_cliente` en lugar de `ClienteID`). SQL Server te tira `Invalid column name '...'` y te hace dudar del trigger entero, cuando el problema es solo un typo. **Costumbre profesional: abrí el DDL de la tabla destino en otra ventana antes de escribir el trigger.** No "lo sabés de memoria" — lo verificás.
+
+### Pregúntate antes de escribir un trigger
+
+- ¿Lo que necesito es **reaccionar** a un cambio que sí debe ocurrir, o **sustituirlo**? → `AFTER` vs `INSTEAD OF`.
+- ¿Estoy escribiéndolo pensando "una fila a la vez" o usando `inserted` / `deleted` como conjuntos? → solo el segundo escala.
+- ¿Una `CHECK constraint`, una `FK`, una **columna calculada** o una **vista indexada** resolverían lo mismo con menos código? → si sí, no uses trigger.
+- ¿Verifiqué los nombres reales de columnas contra el DDL?
+
+### Ver también
+
+- [§9 — Columnas calculadas y persistidas](#9-columnas-calculadas-y-columnas-persistidas) (la herramienta que **no** sirvió para el caso del `Total` agregado, y por qué).
+- [§8 — Vistas indexadas](#8-vistas-indexadas-materializadas) (alternativa al trigger cuando lo que querés es un agregado siempre actualizado y consultable — pero con costo de escritura distinto).
+- [§10 — Stored Procedures](#10-stored-procedures-sp) (cuando la lógica es compleja y disparada explícitamente, no automáticamente).
+
 ---
 
 ## Temas pendientes por incorporar
